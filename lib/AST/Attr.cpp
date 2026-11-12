@@ -1361,6 +1361,10 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
 
   switch (getKind()) {
   case DeclAttrKind::Semantics:
+    if (cast<SemanticsAttr>(this)->Value == "_interpreterEntry") {
+      Printer.printAttrName("@_interpreterEntry");
+      break;
+    }
     Printer.printAttrName("@_semantics");
     Printer << "(\"" << cast<SemanticsAttr>(this)->Value << "\")";
     break;
@@ -2155,7 +2159,9 @@ StringRef DeclAttribute::getAttrName() const {
   case DeclAttrKind::SwiftNativeObjCRuntimeBase:
     return "_swift_native_objc_runtime_base";
   case DeclAttrKind::Semantics:
-    return "_semantics";
+    return cast<SemanticsAttr>(this)->Value == "_interpreterEntry"
+               ? "_interpreterEntry"
+               : "_semantics";
   case DeclAttrKind::Available:
     return "available";
   case DeclAttrKind::ObjC:

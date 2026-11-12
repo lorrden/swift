@@ -207,7 +207,6 @@ public:
   IGNORED_ATTR(RawDocComment)
   IGNORED_ATTR(RequiresStoredPropertyInits)
   IGNORED_ATTR(RestatedObjCConformance)
-  IGNORED_ATTR(Semantics)
   IGNORED_ATTR(NoLocks)
   IGNORED_ATTR(NoAllocation)
   IGNORED_ATTR(NoRuntime)
@@ -514,6 +513,7 @@ public:
 
   void visitInheritActorContextAttr(InheritActorContextAttr *attr);
 
+  void visitSemanticsAttr(SemanticsAttr *attr);
   void visitNoImplicitCopyAttr(NoImplicitCopyAttr *attr);
 
   void visitAlwaysEmitConformanceMetadataAttr(AlwaysEmitConformanceMetadataAttr *attr);
@@ -561,6 +561,46 @@ public:
 };
 
 } // end anonymous namespace
+
+void AttributeChecker::visitSemanticsAttr(SemanticsAttr *attr) {
+  if (attr->Value != "_interpreterEntry")
+    return;
+
+  auto *func = dyn_cast<FuncDecl>(D);
+  if (!func || !func->hasBody() || func->hasAsync() || func->hasThrows() ||
+      func->isGenericContext() ||
+      func->getDeclContext()->isEffectivelyGenericContext() ||
+      func->getDeclContext()->isLocalContext() ||
+      func->getFormalAccess() > AccessLevel::Internal ||
+      func->getAttrs().hasAttribute<InlinableAttr>() ||
+      func->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>() ||
+      func->getAttrs().hasAttribute<TransparentAttr>() ||
+      func->getParameters()->size() == 0) {
+    diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
+    return;
+  }
+
+  auto firstType = func->getParameters()->get(0)->getInterfaceType();
+  if (!firstType || firstType->hasError())
+    return;
+  auto *span = firstType->getAs<StructType>();
+  if (!span || span->getDecl()->getName().str() != "Span" ||
+      !span->getDecl()->getModuleContext()->isStdlibModule() ||
+      span->getGenericArgs().size() != 1) {
+    diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
+    return;
+  }
+
+  auto *opcode = dyn_cast_or_null<EnumDecl>(
+      span->getGenericArgs().front()->getAnyNominal());
+  if (!opcode || opcode->isObjC() || opcode->hasClangNode() ||
+      opcode->getNumElements() < 2 ||
+      llvm::any_of(opcode->getAllElements(), [](EnumElementDecl *element) {
+        return element->hasAssociatedValues();
+      })) {
+    diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
+  }
+}
 
 void AttributeChecker::visitNoImplicitCopyAttr(NoImplicitCopyAttr *attr) {
   // Only allow for this attribute to be used when experimental move only is

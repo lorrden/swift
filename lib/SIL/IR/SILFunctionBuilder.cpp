@@ -55,8 +55,14 @@ void SILFunctionBuilder::addFunctionAttributes(
         getOrCreateDeclaration,
     SILDeclRef constant) {
 
-  for (auto *A : Attrs.getAttributes<SemanticsAttr>())
-    F->addSemanticsAttr(cast<SemanticsAttr>(A)->Value);
+  for (auto *A : Attrs.getAttributes<SemanticsAttr>()) {
+    if (A->Value == "_interpreterEntry") {
+      F->addSemanticsAttr("experimental.direct_threading");
+      F->setInlineStrategy(NoInline);
+    } else {
+      F->addSemanticsAttr(A->Value);
+    }
+  }
 
   // If we are asked to emit assembly vision remarks for this function, mark the
   // function as force emitting all optremarks including assembly vision

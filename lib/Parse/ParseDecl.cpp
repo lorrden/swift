@@ -4703,6 +4703,24 @@ ParserStatus Parser::parseDeclAttribute(DeclAttributes &Attributes,
     return makeParserError();
   }
 
+  // The source prototype shares the semantics attribute representation
+  // while the interpreter declaration syntax is being developed.
+  if (!hasModuleSelector && Tok.getText() == "_interpreterEntry") {
+    auto nameLoc = consumeToken(tok::identifier);
+    if (Tok.is(tok::l_paren) && !Tok.isAtStartOfLine()) {
+      diagnose(Tok, diag::unexpected_lparen_in_attribute, "_interpreterEntry");
+      skipSingle();
+      return makeParserError();
+    }
+    if (Attributes.hasSemanticsAttr("_interpreterEntry")) {
+      diagnose(nameLoc, diag::duplicate_attribute, /*isModifier=*/false);
+      return makeParserError();
+    }
+    Attributes.add(new (Context) SemanticsAttr(
+        "_interpreterEntry", AtLoc, SourceRange(nameLoc), /*Implicit=*/false));
+    return makeParserSuccess();
+  }
+
   // If the attribute follows the new representation, switch
   // over to the alternate parsing path.
   std::optional<DeclAttrKind> DK = hasModuleSelector ? std::nullopt :

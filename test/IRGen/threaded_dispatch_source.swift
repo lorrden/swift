@@ -1,5 +1,6 @@
 // REQUIRES: CPU=arm64, OS=macosx, executable_test
 //
+// RUN: %target-swift-frontend -disable-availability-checking -emit-silgen %s | %FileCheck %s --check-prefix=SIL
 // RUN: %target-swift-frontend -O -strict-memory-safety -warnings-as-errors -disable-availability-checking -emit-ir -disable-llvm-optzns %s | %FileCheck %s --check-prefix=IR
 // RUN: %target-build-swift -O -Xfrontend -strict-memory-safety -warnings-as-errors -Xfrontend -disable-availability-checking %s -o %t
 // RUN: %target-run %t | %FileCheck %s --check-prefix=OUTPUT
@@ -10,8 +11,7 @@ enum Opcode {
   case increment, double, halt
 }
 
-@inline(never)
-@_semantics("experimental.direct_threading")
+@_interpreterEntry
 func run(_ program: Span<Opcode>, _ start: Int) -> Int {
   var value = 1
   var pc = start
@@ -26,6 +26,8 @@ func run(_ program: Span<Opcode>, _ start: Int) -> Int {
     }
   }
 }
+
+// SIL: sil hidden [noinline] [_semantics "experimental.direct_threading"]{{.*}} @{{.*}}3run
 
 // IR: @threaded.labels = private constant [3 x ptr]
 // IR-LABEL: define{{.*}}run{{.*}}(ptr
