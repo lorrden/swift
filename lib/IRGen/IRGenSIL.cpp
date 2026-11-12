@@ -430,6 +430,24 @@ public:
   llvm::MapVector<SILBasicBlock *, LoweredBB> LoweredBBs;
 
   SILFunction *CurSILFn;
+
+  // The experiment recognizes an immutable opcode snapshot and keeps its
+  // native representation entirely within the emitted runner.
+  llvm::DenseMap<LoadInst *, llvm::Value *> ThreadedTargets;
+  SmallVector<llvm::BasicBlock *, 8> ThreadedDestinations;
+  ApplyInst *ThreadedSnapshot = nullptr;
+  SILArgument *ThreadedSpan = nullptr;
+  SILType ThreadedEnumType;
+  llvm::Value *ThreadedSnapshotLength = nullptr;
+  llvm::Value *ThreadedStream = nullptr;
+  llvm::Value *ThreadedAllocationSize = nullptr;
+
+  void analyzeThreadedDispatch();
+  void emitThreadedSnapshot(ApplyInst *snapshot);
+  void emitThreadedStream(llvm::Value *input, llvm::Value *count,
+                          const SILDebugScope *scope);
+  bool emitThreadedBranch(TermInst *dispatch, SILValue selector);
+
   // If valid, the address by means of which a return--which is direct in
   // SIL--is passed indirectly in IR.  Such indirection is necessary when the
   // value which would be returned directly cannot fit into registers.
@@ -3094,6 +3112,16 @@ void IRGenSILFunction::visitSILBasicBlock(SILBasicBlock *BB) {
   DominanceScope dominance(*this, InEntryBlock ? DominancePoint::universal()
                                                : DominancePoint(BB));
 
+  if (BB == CurSILFn->getEntryBlock()) {
+    analyzeThreadedDispatch();
+    if (ThreadedSpan) {
+      auto span = getLoweredExplosion(ThreadedSpan);
+      auto *input = span.claimNext();
+      auto *count = span.claimNext();
+      emitThreadedStream(input, count, nullptr);
+    }
+  }
+
   SILInstruction *const CleanupBlockStartInst =
       findFirstCleanupBlockInstruction(*BB);
   bool IsInCleanupBlock = false;
@@ -4091,6 +4119,8 @@ void IRGenSILFunction::visitBuiltinInst(swift::BuiltinInst *i) {
 }
 
 void IRGenSILFunction::visitApplyInst(swift::ApplyInst *i) {
+  if (i == ThreadedSnapshot)
+    return emitThreadedSnapshot(i);
   visitFullApplySite(i);
 }
 
@@ -4894,6 +4924,11 @@ static bool canPeepholeLoadToReturn(IRGenModule &IGM, swift::ReturnInst *r) {
 
 void IRGenSILFunction::visitReturnInst(swift::ReturnInst *i) {
   Explosion result = getLoweredExplosion(i->getOperand());
+  if (ThreadedAllocationSize) {
+    auto *alignMask = llvm::ConstantInt::get(
+        IGM.SizeTy, IGM.getPointerAlignment().getValue() - 1);
+    emitDeallocRawCall(ThreadedStream, ThreadedAllocationSize, alignMask);
+  }
 
   // Implicitly autorelease the return value if the function's result
   // convention is autoreleased.
@@ -5267,7 +5302,320 @@ emitSwitchValueDispatch(IRGenSILFunction &IGF,
   }
 }
 
+// SIL splits critical edges. A block containing only a forwarding branch
+// can be bypassed by passing its operands directly to the landing block.
+static BranchInst *getThreadedForwardingBranch(SILBasicBlock *block) {
+  if (!block->args_empty() || &block->front() != block->getTerminator())
+    return nullptr;
+  return dyn_cast<BranchInst>(block->getTerminator());
+}
+
+// Match the native buffer projection produced by inlining Span.subscript.
+static bool isThreadedSpanPointer(SILValue pointer, SILArgument *span) {
+  auto *raw =
+      dyn_cast_or_null<StructExtractInst>(pointer->getDefiningInstruction());
+  if (!raw)
+    return false;
+  auto *some = dyn_cast_or_null<UncheckedEnumDataInst>(
+      raw->getOperand()->getDefiningInstruction());
+  if (!some)
+    return false;
+  auto *field = dyn_cast_or_null<StructExtractInst>(
+      some->getOperand()->getDefiningInstruction());
+  return field && field->getOperand() == SILValue(span) &&
+         field->getField()->getName().str() == "_pointer";
+}
+
+void IRGenSILFunction::analyzeThreadedDispatch() {
+  // The snapshot marker identifies an immutable, initialized opcode buffer
+  // and its full length. The checked SIL switches serve as the fallback.
+  if (!CurSILFn->hasSemanticsAttr("experimental.direct_threading") ||
+      !IGM.Triple.isMacOSX() || IGM.Triple.getArchName() != "arm64" ||
+      CurSILFn->isAsync() || CurSILFn->isCoroutine() ||
+      CurSILFn->getLoweredFunctionType()->hasErrorResult())
+    return;
+
+  auto *entry = CurSILFn->getEntryBlock();
+  auto &ctx = CurSILFn->getASTContext();
+  auto rawPointerType = SILType::getRawPointerType(ctx);
+  auto wordType = SILType::getBuiltinWordType(ctx);
+  auto opcodeType = SILType::getBuiltinIntegerType(32, ctx);
+  ApplyInst *snapshot = nullptr;
+  for (auto &instruction : *entry) {
+    auto *apply = dyn_cast<ApplyInst>(&instruction);
+    if (!apply)
+      continue;
+    auto *callee = apply->getReferencedFunctionOrNull();
+    if (!callee || !callee->hasSemanticsAttr("experimental.threaded_snapshot"))
+      continue;
+    if (snapshot || apply->getNumArguments() != 2 ||
+        apply->getArgument(0)->getType() != rawPointerType ||
+        apply->getArgument(1)->getType() != wordType ||
+        apply->getType() != rawPointerType)
+      return;
+    snapshot = apply;
+  }
+  SILArgument *span = nullptr;
+  CanType enumType;
+  EnumDecl *enumDecl = nullptr;
+  const EnumImplStrategy *enumStrategy = nullptr;
+  if (!snapshot) {
+    if (!entry->getNumArguments())
+      return;
+    span = entry->getArgument(0);
+    auto spanType = span->getType().getAs<StructType>();
+    if (!spanType || spanType->getDecl()->getName().str() != "Span" ||
+        !spanType->getDecl()->getModuleContext()->isStdlibModule() ||
+        spanType.getGenericArgs().size() != 1)
+      return;
+
+    auto loweredSpan = getLoweredExplosion(span);
+    auto fields = loweredSpan.claimAll();
+    if (fields.size() != 2 || fields[0]->getType() != IGM.Int8PtrTy ||
+        fields[1]->getType() != IGM.IntPtrTy)
+      return;
+
+    enumType = spanType.getGenericArgs().front();
+    auto lowered = SILType::getPrimitiveObjectType(enumType);
+    enumDecl = lowered.getEnumDecl();
+    if (!enumDecl || enumDecl->isObjC() || enumDecl->hasClangNode() ||
+        enumDecl->getNumElements() < 2 ||
+        llvm::any_of(enumDecl->getAllElements(), [](EnumElementDecl *element) {
+          return element->hasAssociatedValues();
+        }))
+      return;
+    if (!isa<FixedTypeInfo>(getTypeInfo(lowered)))
+      return;
+    enumStrategy = &getEnumImplStrategy(IGM, lowered);
+  }
+
+  auto landingBlock = [&](SILBasicBlock *block) -> llvm::BasicBlock * {
+    if (auto *branch = getThreadedForwardingBranch(block))
+      block = branch->getDestBB();
+    if (block == entry)
+      return nullptr;
+    return getLoweredBB(block).bb;
+  };
+
+  llvm::SmallPtrSet<LoadInst *, 4> loads;
+  SmallVector<llvm::BasicBlock *, 8> destinations;
+  if (!Dominance)
+    Dominance = std::make_unique<DominanceInfo>(CurSILFn);
+  for (auto &block : *CurSILFn) {
+    if (!Dominance->isReachableFromEntry(&block))
+      continue;
+    auto *valueSwitch = dyn_cast<SwitchValueInst>(block.getTerminator());
+    auto *enumSwitch = dyn_cast<SwitchEnumInst>(block.getTerminator());
+    SILValue selector;
+    if (snapshot && valueSwitch)
+      selector = valueSwitch->getOperand();
+    else if (span && enumSwitch &&
+             enumSwitch->getOperand()->getType().getASTType() == enumType)
+      selector = enumSwitch->getOperand();
+    else
+      continue;
+
+    auto *opcode = dyn_cast_or_null<LoadInst>(
+        selector->getDefiningInstruction());
+    if (!opcode || (snapshot && opcode->getType() != opcodeType))
+      return;
+    for (auto *use : opcode->getUses()) {
+      auto *user = use->getUser();
+      if (user == block.getTerminator())
+        continue;
+      if (IGM.DebugInfo || !user->isDebugInstruction())
+        return;
+    }
+
+    auto *element = dyn_cast_or_null<IndexAddrInst>(
+        opcode->getOperand()->getDefiningInstruction());
+    if (!element || element->getIndex()->getType() != wordType)
+      return;
+    auto *base = dyn_cast_or_null<PointerToAddressInst>(
+        element->getBase()->getDefiningInstruction());
+    if (!base || (snapshot && base->getOperand() != SILValue(snapshot)) ||
+        (span && !isThreadedSpanPointer(base->getOperand(), span)))
+      return;
+
+    SmallVector<llvm::BasicBlock *, 8> site;
+    if (snapshot) {
+      if (!valueSwitch->hasDefault() || !valueSwitch->getNumCases())
+        return;
+      site.resize(valueSwitch->getNumCases() + 1);
+      for (unsigned i = 0; i != valueSwitch->getNumCases(); ++i) {
+        auto [value, destination] = valueSwitch->getCase(i);
+        auto *literal =
+            dyn_cast_or_null<IntegerLiteralInst>(value->getDefiningInstruction());
+        if (!literal || literal->getValue().uge(valueSwitch->getNumCases()))
+          return;
+        auto slot = literal->getValue().getZExtValue();
+        if (site[slot])
+          return;
+        site[slot] = landingBlock(destination);
+      }
+      site.back() = landingBlock(valueSwitch->getDefaultBB());
+    } else {
+      if (enumSwitch->hasDefault() ||
+          enumSwitch->getNumCases() != enumDecl->getNumElements())
+        return;
+      site.resize(enumSwitch->getNumCases());
+      for (unsigned i = 0; i != enumSwitch->getNumCases(); ++i) {
+        auto [element, destination] = enumSwitch->getCase(i);
+        if (!destination->args_empty())
+          return;
+        auto slot = enumStrategy->getDiscriminatorIndex(element);
+        if (!slot || *slot >= site.size() || site[*slot])
+          return;
+        site[*slot] = landingBlock(destination);
+      }
+    }
+    if (!destinations.empty() && destinations != site)
+      return;
+    llvm::SmallPtrSet<llvm::BasicBlock *, 8> uniqueDestinations;
+    for (auto *destination : site)
+      if (!destination || !uniqueDestinations.insert(destination).second)
+        return;
+    destinations = std::move(site);
+    loads.insert(opcode);
+  }
+  if (loads.empty())
+    return;
+
+  for (auto *load : loads)
+    ThreadedTargets.try_emplace(load, nullptr);
+  ThreadedDestinations = std::move(destinations);
+  ThreadedSnapshot = snapshot;
+  ThreadedSpan = span;
+  if (span)
+    ThreadedEnumType = SILType::getPrimitiveObjectType(enumType);
+
+  // Every address in the stream refers to a landing block in this function.
+  CurFn->removeFnAttr(llvm::Attribute::AlwaysInline);
+  CurFn->addFnAttr(llvm::Attribute::NoInline);
+  CurFn->addFnAttr(llvm::Attribute::NoOutline);
+}
+
+void IRGenSILFunction::emitThreadedSnapshot(ApplyInst *snapshot) {
+  // The marker returns the opcode buffer. The native addresses are private
+  // to IRGen and never appear in the marker's SIL result.
+  auto inputValue = getLoweredExplosion(snapshot->getArgument(0));
+  auto *input = inputValue.getAll().front();
+  setLoweredExplosion(snapshot, inputValue);
+
+  auto *count = getLoweredSingletonExplosion(snapshot->getArgument(1));
+  emitConditionalTrap(Builder.CreateICmpEQ(
+                          count, llvm::ConstantInt::get(IGM.IntPtrTy, 0)),
+                      "empty snapshot", snapshot->getDebugScope());
+  emitThreadedStream(input, count, snapshot->getDebugScope());
+}
+
+void IRGenSILFunction::emitThreadedStream(llvm::Value *input,
+                                        llvm::Value *count,
+                                        const SILDebugScope *scope) {
+  auto *tableType =
+      llvm::ArrayType::get(IGM.Int8PtrTy, ThreadedDestinations.size());
+  SmallVector<llvm::Constant *, 8> labels;
+  for (auto *destination : ThreadedDestinations)
+    labels.push_back(llvm::BlockAddress::get(CurFn, destination));
+  auto *table = new llvm::GlobalVariable(
+      IGM.Module, tableType, true, llvm::GlobalValue::PrivateLinkage,
+      llvm::ConstantArray::get(tableType, labels), "threaded.labels");
+
+  ThreadedSnapshotLength = count;
+  auto *zero = llvm::ConstantInt::get(IGM.IntPtrTy, 0);
+  auto *one = llvm::ConstantInt::get(IGM.IntPtrTy, 1);
+  auto *empty = Builder.CreateICmpEQ(count, zero);
+
+  auto *constantCount = dyn_cast<llvm::ConstantInt>(count);
+  if (constantCount && constantCount->getValue().ule(1024)) {
+    ThreadedStream =
+        createAlloca(IGM.Int8PtrTy, count, IGM.getPointerAlignment(),
+                     "threaded.stream").getAddress();
+  } else {
+    // Keep the full allocation within the range of a signed pointer offset.
+    auto pointerSize = IGM.getPointerSize().getValue();
+    auto maxBytes = APInt::getSignedMaxValue(IGM.IntPtrTy->getBitWidth());
+    auto *maxCount =
+        llvm::ConstantInt::get(IGM.IntPtrTy, maxBytes.udiv(pointerSize));
+    emitConditionalTrap(Builder.CreateICmpUGT(count, maxCount),
+                        "threaded snapshot is too large",
+                        scope);
+    auto *stride = llvm::ConstantInt::get(IGM.SizeTy, pointerSize);
+    // A valid empty Span may return without dispatching.
+    auto *allocationCount =
+        ThreadedSpan ? Builder.CreateSelect(empty, one, count) : count;
+    ThreadedAllocationSize = Builder.CreateMul(allocationCount, stride);
+    auto *alignMask = llvm::ConstantInt::get(
+        IGM.SizeTy, IGM.getPointerAlignment().getValue() - 1);
+    ThreadedStream =
+        emitAllocRawCall(ThreadedAllocationSize, alignMask, "threaded.stream");
+  }
+  auto *start = Builder.GetInsertBlock();
+  auto *loop = createBasicBlock("threaded.prepare");
+  auto *done = createBasicBlock("threaded.ready");
+  if (ThreadedSpan)
+    Builder.CreateCondBr(empty, done, loop);
+  else
+    Builder.CreateBr(loop);
+  Builder.emitBlock(loop);
+  auto *index = Builder.CreatePHI(IGM.IntPtrTy, 2, "threaded.index");
+  index->addIncoming(zero, start);
+  llvm::Value *slot;
+  if (ThreadedSpan) {
+    const auto &typeInfo = getTypeInfo(ThreadedEnumType);
+    Address base(input, typeInfo.getStorageType(),
+                 typeInfo.getBestKnownAlignment());
+    auto cell = typeInfo.indexArray(*this, base, index, ThreadedEnumType);
+    const auto &strategy = getEnumImplStrategy(IGM, ThreadedEnumType);
+    slot = strategy.emitGetEnumTag(*this, ThreadedEnumType, cell);
+  } else {
+    auto *opcodeCell = Builder.CreateInBoundsGEP(IGM.Int32Ty, input, index);
+    auto *opcode = Builder.CreateLoad(opcodeCell, IGM.Int32Ty, Alignment(4));
+    auto *defaultSlot =
+        llvm::ConstantInt::get(IGM.Int32Ty, ThreadedDestinations.size() - 1);
+    slot = Builder.CreateSelect(Builder.CreateICmpULT(opcode, defaultSlot),
+                                opcode, defaultSlot);
+  }
+  auto *labelCell = Builder.CreateInBoundsGEP(
+      tableType, table, {zero, Builder.CreateZExt(slot, IGM.IntPtrTy)});
+  auto *label = Builder.CreateLoad(labelCell, IGM.Int8PtrTy,
+                                  IGM.getPointerAlignment());
+  auto *cell = Builder.CreateInBoundsGEP(IGM.Int8PtrTy, ThreadedStream, index);
+  Builder.CreateStore(label, cell, IGM.getPointerAlignment());
+  auto *next = Builder.CreateAdd(index, one);
+  index->addIncoming(next, loop);
+  Builder.CreateCondBr(Builder.CreateICmpEQ(next, count), done, loop);
+  Builder.emitBlock(done);
+}
+
+static void addIncomingSILArgumentsToPHINodes(IRGenSILFunction &IGF,
+                                              LoweredBB &lbb,
+                                              OperandValueArrayRef args);
+
+bool IRGenSILFunction::emitThreadedBranch(TermInst *dispatch,
+                                        SILValue selector) {
+  if (ThreadedTargets.empty())
+    return false;
+  auto *opcode = dyn_cast_or_null<LoadInst>(selector->getDefiningInstruction());
+  auto threaded = ThreadedTargets.find(opcode);
+  if (threaded == ThreadedTargets.end())
+    return false;
+  assert(threaded->second && "threaded dispatch target was not loaded");
+  for (auto *successor : dispatch->getSuccessorBlocks()) {
+    if (auto *forward = getThreadedForwardingBranch(successor))
+      addIncomingSILArgumentsToPHINodes(
+          *this, getLoweredBB(forward->getDestBB()), forward->getArgs());
+  }
+  auto *branch = Builder.CreateIndirectBr(threaded->second,
+                                          ThreadedDestinations.size());
+  for (auto *destination : ThreadedDestinations)
+    branch->addDestination(destination);
+  return true;
+}
+
 void IRGenSILFunction::visitSwitchValueInst(SwitchValueInst *inst) {
+  if (emitThreadedBranch(inst, inst->getOperand()))
+    return;
   Explosion value = getLoweredExplosion(inst->getOperand());
 
   // Map the SIL dest bbs to their LLVM bbs.
@@ -5362,6 +5710,8 @@ static llvm::BasicBlock *emitBBMapForSwitchEnum(
 }
 
 void IRGenSILFunction::visitSwitchEnumInst(SwitchEnumInst *inst) {
+  if (emitThreadedBranch(inst, inst->getOperand()))
+    return;
   Explosion value = getLoweredExplosion(inst->getOperand(), &Builder);
 
   // Map the SIL dest bbs to their LLVM bbs.
@@ -6112,6 +6462,19 @@ static bool isInvariantAddress(SILValue v) {
 }
 
 void IRGenSILFunction::visitLoadInst(swift::LoadInst *i) {
+  auto threaded = ThreadedTargets.find(i);
+  if (threaded != ThreadedTargets.end()) {
+    auto *element =
+        cast<IndexAddrInst>(i->getOperand()->getDefiningInstruction());
+    auto *index = getLoweredSingletonExplosion(element->getIndex());
+    emitConditionalTrap(Builder.CreateICmpUGE(index, ThreadedSnapshotLength),
+                        "invalid threaded instruction index", i->getDebugScope());
+    auto *cell = Builder.CreateInBoundsGEP(IGM.Int8PtrTy, ThreadedStream, index);
+    threaded->second = Builder.CreateLoad(cell, IGM.Int8PtrTy,
+                                          IGM.getPointerAlignment());
+    return;
+  }
+
   Explosion lowered;
   Address source = getLoweredAddress(i->getOperand());
   SILType objType = i->getType().getObjectType();
@@ -6387,6 +6750,9 @@ void IRGenSILFunction::visitDebugValueInst(DebugValueInst *i) {
   // If there is a debug reconstruction block, the debug_value operand isn't
   // the value of the variable.
   SILValue SILVal = DebugBB ? SILValue() : i->getSingleOperand();
+  if (SILVal && ThreadedTargets.contains(dyn_cast_or_null<LoadInst>(
+                    SILVal->getDefiningInstruction())))
+    return;
   if (i->getDebugScope()->getInlinedFunction()->isTransparent())
     return;
 

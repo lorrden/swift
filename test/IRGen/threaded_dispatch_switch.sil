@@ -1,0 +1,118 @@
+// RUN: %target-sil-opt -enable-sil-verify-all %s | %target-sil-opt -enable-sil-verify-all | %FileCheck %s
+// RUN: %target-swift-frontend -parse-sil -emit-ir -disable-llvm-optzns -Onone %s | %FileCheck %s --check-prefix=IR
+//
+// Switch reference for threaded_dispatch_reference.ll. Both dispatch sites
+// have the same logical destinations. The SIL edges have separate empty
+// trampolines so that the handler blocks have no critical incoming edges.
+
+sil_stage canonical
+
+import Builtin
+
+// The fallback returns the immutable opcode buffer. Native IRGen prepares
+// the address stream at this explicit snapshot marker.
+sil [noinline] [Onone] [_semantics "experimental.threaded_snapshot"] @snapshot : $@convention(thin) (Builtin.RawPointer, Builtin.Word) -> Builtin.RawPointer {
+bb0(%code : $Builtin.RawPointer, %length : $Builtin.Word):
+  %zero = integer_literal $Builtin.Word, 0
+  %empty = builtin "cmp_eq_Word"(%length : $Builtin.Word, %zero : $Builtin.Word) : $Builtin.Int1
+  cond_fail %empty : $Builtin.Int1, "empty snapshot"
+  return %code : $Builtin.RawPointer
+}
+
+// CHECK-LABEL: sil @run
+// CHECK: switch_value
+// CHECK: switch_value
+// IR-LABEL: define{{.*}} @run(
+// IR: switch i32
+// IR: switch i32
+sil @run : $@convention(thin) (Builtin.RawPointer) -> Builtin.Int32 {
+bb0(%code : $Builtin.RawPointer):
+  %zero = integer_literal $Builtin.Word, 0
+  %step = integer_literal $Builtin.Word, 1
+  %length = integer_literal $Builtin.Word, 3
+  %snapshot = function_ref @snapshot : $@convention(thin) (Builtin.RawPointer, Builtin.Word) -> Builtin.RawPointer
+  %opcodes = apply %snapshot(%code, %length) : $@convention(thin) (Builtin.RawPointer, Builtin.Word) -> Builtin.RawPointer
+  %base = pointer_to_address %opcodes : $Builtin.RawPointer to [strict] $*Builtin.Int32
+  %increment = integer_literal $Builtin.Int32, 0
+  %double = integer_literal $Builtin.Int32, 1
+  %halt = integer_literal $Builtin.Int32, 2
+  %pc_slot = alloc_stack $Builtin.Word
+  %acc_slot = alloc_stack $Builtin.Int32
+  store %zero to %pc_slot : $*Builtin.Word
+  store %double to %acc_slot : $*Builtin.Int32
+  br bb1
+
+bb1:
+  %pc = load %pc_slot : $*Builtin.Word
+  %out_of_bounds = builtin "cmp_uge_Word"(%pc : $Builtin.Word, %length : $Builtin.Word) : $Builtin.Int1
+  cond_br %out_of_bounds, bb3, bb2
+
+bb2:
+  %cell = index_addr %base : $*Builtin.Int32, %pc : $Builtin.Word
+  %opcode = load %cell : $*Builtin.Int32
+  %next = builtin "add_Word"(%pc : $Builtin.Word, %step : $Builtin.Word) : $Builtin.Word
+  store %next to %pc_slot : $*Builtin.Word
+  switch_value %opcode : $Builtin.Int32, case %increment: bb4, case %double: bb5, case %halt: bb6, default bb7
+
+bb3:
+  br bb16
+
+bb4:
+  br bb12
+
+bb5:
+  br bb13
+
+bb6:
+  br bb15
+
+bb7:
+  br bb16
+
+bb8:
+  %double_cell = index_addr %base : $*Builtin.Int32, %double_pc : $Builtin.Word
+  %double_opcode = load %double_cell : $*Builtin.Int32
+  %double_next = builtin "add_Word"(%double_pc : $Builtin.Word, %step : $Builtin.Word) : $Builtin.Word
+  store %double_next to %pc_slot : $*Builtin.Word
+  switch_value %double_opcode : $Builtin.Int32, case %increment: bb9, case %double: bb10, case %halt: bb11, default bb17
+
+bb9:
+  br bb12
+
+bb10:
+  br bb13
+
+bb11:
+  br bb15
+
+bb12:
+  %increment_acc = load %acc_slot : $*Builtin.Int32
+  %incremented = builtin "add_Int32"(%increment_acc : $Builtin.Int32, %double : $Builtin.Int32) : $Builtin.Int32
+  store %incremented to %acc_slot : $*Builtin.Int32
+  br bb1
+
+bb13:
+  %double_acc = load %acc_slot : $*Builtin.Int32
+  %doubled = builtin "add_Int32"(%double_acc : $Builtin.Int32, %double_acc : $Builtin.Int32) : $Builtin.Int32
+  store %doubled to %acc_slot : $*Builtin.Int32
+  %double_pc = load %pc_slot : $*Builtin.Word
+  %double_in_bounds = builtin "cmp_ult_Word"(%double_pc : $Builtin.Word, %length : $Builtin.Word) : $Builtin.Int1
+  cond_br %double_in_bounds, bb8, bb14
+
+bb14:
+  br bb16
+
+bb15:
+  %result = load %acc_slot : $*Builtin.Int32
+  dealloc_stack %acc_slot : $*Builtin.Int32
+  dealloc_stack %pc_slot : $*Builtin.Word
+  return %result : $Builtin.Int32
+
+bb16:
+  %invalid = integer_literal $Builtin.Int1, -1
+  cond_fail %invalid : $Builtin.Int1, "invalid PC or opcode"
+  unreachable
+
+bb17:
+  br bb16
+}
