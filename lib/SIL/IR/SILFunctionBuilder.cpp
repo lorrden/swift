@@ -59,6 +59,8 @@ void SILFunctionBuilder::addFunctionAttributes(
     if (A->Value == "_interpreterEntry") {
       F->addSemanticsAttr("experimental.direct_threading");
       F->setInlineStrategy(NoInline);
+    } else if (A->Value.split(':').first == "_opcodeHandler") {
+      F->setInlineStrategy(AlwaysInline);
     } else {
       F->addSemanticsAttr(A->Value);
     }

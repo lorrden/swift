@@ -92,7 +92,10 @@ bool Parser::isStartOfStmt(bool preferExpr) {
     if (!peekToken().is(tok::colon)) {
       // "yield", "discard", and "then" in the right context begins a statement.
       if (isContextualYieldKeyword() || isContextualDiscardKeyword() ||
-          isContextualThenKeyword(preferExpr)) {
+          isContextualThenKeyword(preferExpr) ||
+          (Tok.isContextualKeyword("dispatch") &&
+           peekToken().isContextualKeyword("at") &&
+           !peekToken().isAtStartOfLine())) {
         return true;
       }
       return false;
@@ -561,6 +564,31 @@ ParserResult<Stmt> Parser::parseStmt() {
 
   if (isContextualThenKeyword(/*preferExpr*/ false))
     Tok.setKind(tok::kw_then);
+
+  if (Tok.isContextualKeyword("dispatch") &&
+      peekToken().isContextualKeyword("at") && !peekToken().isAtStartOfLine()) {
+    auto loc = consumeToken(tok::identifier);
+    consumeToken(tok::identifier);
+    if (LabelInfo)
+      diagnose(LabelInfo.Loc, diag::invalid_label_on_stmt);
+    if (tryLoc.isValid())
+      diagnose(tryLoc, diag::try_on_stmt, "dispatch");
+    auto index = parseExprBasic(diag::expected_expr);
+    if (index.isNull())
+      return makeParserErrorResult<Stmt>();
+    if (isa<AbstractClosureExpr>(CurDeclContext)) {
+      diagnose(loc, diag::pound_error,
+               "'dispatch at' requires a mutating @_interpreterEntry method");
+      return makeParserErrorResult<Stmt>();
+    }
+
+    // Use a parsed switch placeholder until dispatch has its own AST node.
+    // The internal label cannot occur in ordinary source.
+    LabeledStmtInfo dispatch{Context.getIdentifier("$dispatchAt"), loc};
+    return makeParserResult(
+        ParserStatus(index), SwitchStmt::create(dispatch, loc, index.get(),
+            SourceLoc(), {}, SourceLoc(), PreviousLoc, Context));
+  }
 
   // This needs to handle everything that `Parser::isStartOfStmt()` accepts as
   // start of statement.

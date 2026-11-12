@@ -4705,19 +4705,42 @@ ParserStatus Parser::parseDeclAttribute(DeclAttributes &Attributes,
 
   // The source prototype shares the semantics attribute representation
   // while the interpreter declaration syntax is being developed.
-  if (!hasModuleSelector && Tok.getText() == "_interpreterEntry") {
+  auto spelling = Tok.getText();
+  if (!hasModuleSelector &&
+      (spelling == "_interpreterEntry" || spelling == "_opcodeHandler")) {
     auto nameLoc = consumeToken(tok::identifier);
+    auto endLoc = nameLoc;
+    StringRef value = spelling;
     if (Tok.is(tok::l_paren) && !Tok.isAtStartOfLine()) {
-      diagnose(Tok, diag::unexpected_lparen_in_attribute, "_interpreterEntry");
-      skipSingle();
-      return makeParserError();
+      if (spelling != "_opcodeHandler") {
+        diagnose(Tok, diag::unexpected_lparen_in_attribute, spelling);
+        skipSingle();
+        return makeParserError();
+      }
+
+      auto openLoc = consumeToken(tok::l_paren);
+      Identifier enumName, caseName;
+      SourceLoc enumLoc, caseLoc;
+      if (parseIdentifier(enumName, enumLoc, /*diagnoseDollarPrefix=*/true,
+                          diag::expected_identifier_for_type) ||
+          parseToken(tok::period, diag::expected_identifier_in_dotted_type) ||
+          parseIdentifier(caseName, caseLoc, /*diagnoseDollarPrefix=*/true,
+                          diag::expected_identifier_after_dot_expr) ||
+          parseMatchingToken(tok::r_paren, endLoc,
+                             diag::expected_rparen_expr_list, openLoc))
+        return makeParserError();
+      value = Context.AllocateCopy(
+          (llvm::Twine(spelling) + ":" + enumName.str() + "." +
+           caseName.str()).str());
     }
-    if (Attributes.hasSemanticsAttr("_interpreterEntry")) {
-      diagnose(nameLoc, diag::duplicate_attribute, /*isModifier=*/false);
-      return makeParserError();
+    for (auto *attr : Attributes.getAttributes<SemanticsAttr>()) {
+      if (attr->Value.split(':').first == spelling) {
+        diagnose(nameLoc, diag::duplicate_attribute, /*isModifier=*/false);
+        return makeParserError();
+      }
     }
     Attributes.add(new (Context) SemanticsAttr(
-        "_interpreterEntry", AtLoc, SourceRange(nameLoc), /*Implicit=*/false));
+        value, AtLoc, SourceRange(nameLoc, endLoc), /*Implicit=*/false));
     return makeParserSuccess();
   }
 

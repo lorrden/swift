@@ -563,7 +563,9 @@ public:
 } // end anonymous namespace
 
 void AttributeChecker::visitSemanticsAttr(SemanticsAttr *attr) {
-  if (attr->Value != "_interpreterEntry")
+  auto [spelling, binding] = attr->Value.split(':');
+  bool isHandler = spelling == "_opcodeHandler";
+  if (attr->Value != "_interpreterEntry" && !isHandler)
     return;
 
   auto *func = dyn_cast<FuncDecl>(D);
@@ -574,12 +576,48 @@ void AttributeChecker::visitSemanticsAttr(SemanticsAttr *attr) {
       func->getFormalAccess() > AccessLevel::Internal ||
       func->getAttrs().hasAttribute<InlinableAttr>() ||
       func->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>() ||
-      func->getAttrs().hasAttribute<TransparentAttr>() ||
-      func->getParameters()->size() == 0) {
+      func->getAttrs().hasAttribute<TransparentAttr>()) {
     diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
     return;
   }
 
+  if (isHandler) {
+    auto *context = func->getDeclContext();
+    auto *nominal = context->getSelfNominalTypeDecl();
+    auto result = func->getResultInterfaceType();
+    auto *inlining = func->getAttrs().getAttribute<InlineAttr>();
+    if (!isa_and_nonnull<StructDecl>(nominal) || !func->isMutating() ||
+        func->getParameters()->size() != 0 || !result || !result->isVoid() ||
+        context->getParentSourceFile() !=
+            nominal->getDeclContext()->getParentSourceFile() ||
+        (inlining && inlining->getKind() == InlineKind::Never)) {
+      diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
+      return;
+    }
+
+    if (!binding.empty()) {
+      auto names = binding.split('.');
+      auto caseName = names.second;
+      auto found = TypeChecker::lookupUnqualifiedType(
+          context, DeclNameRef(Ctx.getIdentifier(names.first)),
+          attr->getLocation());
+      auto *opcode = dyn_cast_or_null<EnumDecl>(found.getSingleTypeResult());
+      if (!opcode ||
+          opcode->getDeclContext()->getParentSourceFile() !=
+              context->getParentSourceFile() ||
+          !llvm::any_of(opcode->getAllElements(), [&](EnumElementDecl *element) {
+            return element->getBaseIdentifier().str() == caseName &&
+                   !element->hasAssociatedValues();
+          }))
+        diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
+    }
+    return;
+  }
+
+  if (func->getParameters()->size() == 0) {
+    diagnoseAndRemoveAttr(attr, diag::invalid_decl_attribute, attr);
+    return;
+  }
   auto firstType = func->getParameters()->get(0)->getInterfaceType();
   if (!firstType || firstType->hasError())
     return;

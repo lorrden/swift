@@ -1994,7 +1994,108 @@ public:
     }
   }
 
+  Stmt *checkDispatchAt(SwitchStmt *parsed) {
+    auto &ctx = getASTContext();
+    auto loc = parsed->getSwitchLoc();
+    auto *entry = dyn_cast<FuncDecl>(DC);
+    auto *machine = entry ? dyn_cast_or_null<StructDecl>(
+        entry->getDeclContext()->getSelfNominalTypeDecl()) : nullptr;
+    if (!entry || !machine || !entry->isMutating() ||
+        !entry->getAttrs().hasSemanticsAttr("_interpreterEntry") ||
+        !entry->getParameters()->size()) {
+      ctx.Diags.diagnose(loc, diag::pound_error,
+               "'dispatch at' requires a mutating @_interpreterEntry method");
+      return nullptr;
+    }
+    auto *program = entry->getParameters()->get(0);
+    auto programType = program->getInterfaceType();
+    auto *span = programType ? programType->getAs<StructType>() : nullptr;
+    if (!span || span->getDecl()->getName().str() != "Span" ||
+        !span->getDecl()->getModuleContext()->isStdlibModule() ||
+        span->getGenericArgs().size() != 1)
+      return nullptr;
+    auto opcodeType = span->getGenericArgs().front();
+    auto *opcode = dyn_cast_or_null<EnumDecl>(opcodeType->getAnyNominal());
+    if (!opcode)
+      return nullptr;
+
+    auto *file = DC->getParentSourceFile();
+    if (file != machine->getDeclContext()->getParentSourceFile() ||
+        file != opcode->getDeclContext()->getParentSourceFile()) {
+      ctx.Diags.diagnose(loc, diag::pound_error,
+               "'dispatch at' requires the interpreter and opcode enum in the same file");
+      return nullptr;
+    }
+
+    llvm::DenseMap<Identifier, FuncDecl *> handlers;
+    bool duplicate = false;
+    auto collect = [&](IterableDeclContext *context) {
+      for (auto *member : context->getMembers()) {
+        auto *handler = dyn_cast<FuncDecl>(member);
+        if (!handler)
+          continue;
+        for (auto *attr : handler->getAttrs().getAttributes<SemanticsAttr>()) {
+          auto [spelling, binding] = attr->Value.split(':');
+          if (spelling != "_opcodeHandler" || binding.empty())
+            continue;
+          auto [enumName, caseName] = binding.split('.');
+          auto found = TypeChecker::lookupUnqualifiedType(
+              handler->getDeclContext(), DeclNameRef(ctx.getIdentifier(enumName)),
+              attr->getLocation());
+          if (found.getSingleTypeResult() != opcode)
+            continue;
+          if (!handlers.try_emplace(ctx.getIdentifier(caseName), handler).second) {
+            ctx.Diags.diagnose(attr->getLocation(), diag::pound_error,
+                     "duplicate opcode handler");
+            duplicate = true;
+          }
+        }
+      }
+    };
+    collect(machine);
+    for (auto *ext : machine->getExtensions())
+      if (ext->getParentSourceFile() == file)
+        collect(ext);
+    if (duplicate)
+      return nullptr;
+
+    SmallVector<CaseStmt *, 8> cases;
+    for (auto *element : opcode->getAllElements()) {
+      auto *handler = handlers.lookup(element->getBaseIdentifier());
+      if (!handler) {
+        ctx.Diags.diagnose(loc, diag::pound_error,
+                 (llvm::Twine("missing opcode handler for '") +
+                  element->getBaseIdentifier().str() + "'").str());
+        return nullptr;
+      }
+      auto *self = new (ctx) DeclRefExpr(
+          entry->getImplicitSelfDecl(), DeclNameLoc(loc), /*Implicit=*/true);
+      auto *member = new (ctx) MemberRefExpr(
+          self, loc, ConcreteDeclRef(handler), DeclNameLoc(loc), /*Implicit=*/true);
+      auto *call = CallExpr::createImplicit(
+          ctx, member, ArgumentList::createImplicit(ctx, {}));
+      auto *pattern = EnumElementPattern::createImplicit(
+          opcodeType, element, nullptr, DC);
+      auto *body = BraceStmt::create(ctx, loc, ASTNode(call), loc,
+                                    /*implicit=*/true);
+      cases.push_back(CaseStmt::createImplicit(
+          ctx, CaseParentKind::Switch, CaseLabelItem(pattern), body));
+    }
+
+    auto *programRef = new (ctx) DeclRefExpr(
+        program, DeclNameLoc(loc), /*Implicit=*/true);
+    auto *args = ArgumentList::forImplicitSingle(
+        ctx, Identifier(), parsed->getSubjectExpr());
+    auto *subject = SubscriptExpr::create(
+        ctx, programRef, args, ConcreteDeclRef(), /*implicit=*/true);
+    auto *expanded = SwitchStmt::createImplicit(LabeledStmtInfo(), subject, cases, ctx);
+    return visitSwitchStmt(expanded);
+  }
+
   Stmt *visitSwitchStmt(SwitchStmt *switchStmt) {
+    if (switchStmt->getLabelInfo().Name.str() == "$dispatchAt")
+      return checkDispatchAt(switchStmt);
+
     // Type-check the subject expression.
     Expr *subjectExpr = switchStmt->getSubjectExpr();
     auto resultTy = TypeChecker::typeCheckExpression(subjectExpr, DC);
