@@ -585,9 +585,13 @@ void AttributeChecker::visitSemanticsAttr(SemanticsAttr *attr) {
     auto *context = func->getDeclContext();
     auto *nominal = context->getSelfNominalTypeDecl();
     auto result = func->getResultInterfaceType();
+    auto continuation = result ? result->getOptionalObjectType() : Type();
+    bool returnsContinuation =
+        continuation && continuation->isEqual(Ctx.getIntType());
     auto *inlining = func->getAttrs().getAttribute<InlineAttr>();
     if (!isa_and_nonnull<StructDecl>(nominal) || !func->isMutating() ||
-        func->getParameters()->size() != 0 || !result || !result->isVoid() ||
+        func->getParameters()->size() != 0 || !result ||
+        (!result->isVoid() && (binding.empty() || !returnsContinuation)) ||
         context->getParentSourceFile() !=
             nominal->getDeclContext()->getParentSourceFile() ||
         (inlining && inlining->getKind() == InlineKind::Never)) {

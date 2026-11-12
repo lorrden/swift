@@ -54,3 +54,30 @@ struct NestedDispatch {
     closure()
   }
 }
+
+struct MixedResults {
+  @_opcodeHandler(Opcode.step)
+  mutating func step() -> Int? { nil }
+
+  @_opcodeHandler(Opcode.halt)
+  mutating func halt() {}
+
+  @_interpreterEntry
+  mutating func run(_ program: Span<Opcode>) {
+    dispatch at 0 // expected-error {{opcode handlers must all return Void or all return Int?}}
+  }
+}
+
+struct VoidTransfer {
+  @_opcodeHandler(Opcode.step)
+  mutating func step() {
+    dispatch at 0 // expected-error {{'dispatch at' in a handler requires an Int? result}}
+  }
+}
+
+struct OptionalTransfer {
+  @_opcodeHandler(Opcode.step)
+  mutating func step() -> Int? {
+    dispatch at nil // expected-error {{'nil' cannot be used in context expecting type 'Int'}}
+  }
+}

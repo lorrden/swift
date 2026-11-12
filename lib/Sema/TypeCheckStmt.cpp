@@ -1997,7 +1997,29 @@ public:
   Stmt *checkDispatchAt(SwitchStmt *parsed) {
     auto &ctx = getASTContext();
     auto loc = parsed->getSwitchLoc();
+    auto indexExpression = [&]() -> Expr * {
+      return CoerceExpr::createImplicit(ctx, parsed->getSubjectExpr(),
+                                        ctx.getIntType());
+    };
     auto *entry = dyn_cast<FuncDecl>(DC);
+    if (entry && llvm::any_of(
+                     entry->getAttrs().getAttributes<SemanticsAttr>(),
+                     [](const SemanticsAttr *attr) {
+                       return attr->Value.starts_with("_opcodeHandler:");
+                     })) {
+      auto result = entry->getResultInterfaceType();
+      auto indexType = result ? result->getOptionalObjectType() : Type();
+      if (!indexType || !indexType->isEqual(ctx.getIntType())) {
+        ctx.Diags.diagnose(loc, diag::pound_error,
+                          "'dispatch at' in a handler requires an Int? result");
+        return nullptr;
+      }
+      // A normal return evaluates the index before running the handler's
+      // cleanups. After inlining, it supplies the next iteration of the runner.
+      return visitReturnStmt(
+          ReturnStmt::createParsed(ctx, loc, indexExpression()));
+    }
+
     auto *machine = entry ? dyn_cast_or_null<StructDecl>(
         entry->getDeclContext()->getSelfNominalTypeDecl()) : nullptr;
     if (!entry || !machine || !entry->isMutating() ||
@@ -2059,7 +2081,8 @@ public:
     if (duplicate)
       return nullptr;
 
-    SmallVector<CaseStmt *, 8> cases;
+    SmallVector<std::pair<EnumElementDecl *, FuncDecl *>, 8> bindings;
+    std::optional<bool> useContinuations;
     for (auto *element : opcode->getAllElements()) {
       auto *handler = handlers.lookup(element->getBaseIdentifier());
       if (!handler) {
@@ -2068,28 +2091,85 @@ public:
                   element->getBaseIdentifier().str() + "'").str());
         return nullptr;
       }
-      auto *self = new (ctx) DeclRefExpr(
-          entry->getImplicitSelfDecl(), DeclNameLoc(loc), /*Implicit=*/true);
+
+      auto result = handler->getResultInterfaceType();
+      auto indexType = result ? result->getOptionalObjectType() : Type();
+      bool returnsContinuation =
+          indexType && indexType->isEqual(ctx.getIntType());
+      if (!result || (!result->isVoid() && !returnsContinuation))
+        return nullptr;
+      if (useContinuations && *useContinuations != returnsContinuation) {
+        ctx.Diags.diagnose(
+            loc, diag::pound_error,
+            "opcode handlers must all return Void or all return Int?");
+        return nullptr;
+      }
+      useContinuations = returnsContinuation;
+      bindings.emplace_back(element, handler);
+    }
+
+    auto reference = [&](ValueDecl *decl) {
+      return new (ctx) DeclRefExpr(decl, DeclNameLoc(loc), /*Implicit=*/true);
+    };
+
+    VarDecl *next = nullptr;
+    VarDecl *current = nullptr;
+    PatternBindingDecl *start = nullptr;
+    if (useContinuations.value_or(false)) {
+      auto nextType = OptionalType::get(ctx.getIntType());
+      next = new (ctx)
+          VarDecl(/*IsStatic=*/false, VarDecl::Introducer::Var, loc,
+                  ctx.getIdentifier("$dispatchNext"), DC);
+      next->setImplicit();
+      next->setInterfaceType(nextType);
+      auto *binding = TypedPattern::createImplicit(
+          ctx, NamedPattern::createImplicit(ctx, next), nextType);
+      start = PatternBindingDecl::createImplicit(
+          ctx, StaticSpellingKind::None, binding, indexExpression(), DC, loc);
+      current = new (ctx)
+          VarDecl(/*IsStatic=*/false, VarDecl::Introducer::Let, loc,
+                  ctx.getIdentifier("$dispatchCurrent"), DC);
+      current->setImplicit();
+    }
+
+    SmallVector<CaseStmt *, 8> cases;
+    for (auto [element, handler] : bindings) {
       auto *member = new (ctx) MemberRefExpr(
-          self, loc, ConcreteDeclRef(handler), DeclNameLoc(loc), /*Implicit=*/true);
-      auto *call = CallExpr::createImplicit(
-          ctx, member, ArgumentList::createImplicit(ctx, {}));
+          reference(entry->getImplicitSelfDecl()), loc,
+          ConcreteDeclRef(handler), DeclNameLoc(loc), /*Implicit=*/true);
+      Expr *call = CallExpr::createImplicitEmpty(ctx, member);
+      if (next)
+        call = new (ctx) AssignExpr(reference(next), loc, call,
+                                    /*Implicit=*/true);
       auto *pattern = EnumElementPattern::createImplicit(
           opcodeType, element, nullptr, DC);
-      auto *body = BraceStmt::create(ctx, loc, ASTNode(call), loc,
-                                    /*implicit=*/true);
+      auto *body = BraceStmt::createImplicit(ctx, loc, ASTNode(call), loc);
       cases.push_back(CaseStmt::createImplicit(
           ctx, CaseParentKind::Switch, CaseLabelItem(pattern), body));
     }
 
     auto *programRef = new (ctx) DeclRefExpr(
         program, DeclNameLoc(loc), /*Implicit=*/true);
-    auto *args = ArgumentList::forImplicitSingle(
-        ctx, Identifier(), parsed->getSubjectExpr());
+    Expr *index = current ? reference(current) : indexExpression();
+    auto *args = ArgumentList::forImplicitSingle(ctx, Identifier(), index);
     auto *subject = SubscriptExpr::create(
         ctx, programRef, args, ConcreteDeclRef(), /*implicit=*/true);
-    auto *expanded = SwitchStmt::createImplicit(LabeledStmtInfo(), subject, cases, ctx);
-    return visitSwitchStmt(expanded);
+    auto *expanded =
+        SwitchStmt::createImplicit(LabeledStmtInfo(), subject, cases, ctx);
+    if (!next)
+      return visitSwitchStmt(expanded);
+
+    auto *pattern = OptionalSomePattern::createImplicit(
+        ctx, NamedPattern::createImplicit(ctx, current));
+    auto *condition = ConditionalPatternBindingInfo::create(
+        ctx, SourceLoc(), pattern, reference(next));
+    StmtConditionElement elements[] = {StmtConditionElement(condition)};
+    auto *body = BraceStmt::createImplicit(ctx, loc, ASTNode(expanded), loc);
+    auto *loop = new (ctx) WhileStmt(
+        LabeledStmtInfo(), loc,
+        ctx.AllocateCopy(llvm::ArrayRef(elements)), body, /*implicit=*/true);
+    auto *scope = BraceStmt::createImplicit(ctx, loc, {start, next, loop}, loc);
+    return visitBraceStmt(scope);
   }
 
   Stmt *visitSwitchStmt(SwitchStmt *switchStmt) {
